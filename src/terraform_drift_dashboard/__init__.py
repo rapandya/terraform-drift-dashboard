@@ -1,2 +1,2 @@
-def main() -> None:
-    print("Hello from terraform-drift-dashboard!")
+"""Terraform Drift Dashboard Package."""
+__version__ = "0.1.0"

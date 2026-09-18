@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-terraform-drift-dashboard = "terraform_drift_dashboard:main"
+terraform-drift-dashboard = "terraform_drift_dashboard.main:start"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
