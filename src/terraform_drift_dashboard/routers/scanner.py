@@ -1,50 +1,67 @@
-import asyncio
 import os
+import sys
+import yaml
 import subprocess
 from pathlib import Path
-from typing import Any, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
-import yaml
-from fastapi import APIRouter, BackgroundTasks
-from fastapi.responses import JSONResponse
+# Determine project paths - search parent directories dynamically for projects.yaml
+BASE_DIR = Path(__file__).resolve().parent
 
-router = APIRouter(prefix="/api", tags=["Scanner"])
+def find_config_path() -> Path:
+    """Finds projects.yaml by checking current and parent directories."""
+    for parent in [BASE_DIR] + list(BASE_DIR.parents):
+        candidate = parent / "projects.yaml"
+        if candidate.exists():
+            return candidate
+    return BASE_DIR.parent.parent.parent / "projects.yaml"
 
-is_scanning: bool = False
+CONFIG_PATH = find_config_path()
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-CONFIG_PATH = PROJECT_ROOT / "projects.yaml"
+# Restrict maximum parallel Makefile/Terraform processes to prevent CPU/RAM crashes
+MAX_CONCURRENT_WORKERS = 2
+
+# Set up central Terraform plugin cache directory to save disk space and network
+PLUGIN_CACHE_DIR = Path("/tmp/terraform_plugin_cache")
+PLUGIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ["TF_IN_AUTOMATION"] = "true"
+os.environ["TF_PLUGIN_CACHE_DIR"] = str(PLUGIN_CACHE_DIR)
 
 ENVIRONMENTS = ["dev", "qa", "perf", "prod"]
 
+# Global state in memory
+is_scanning = False
+current_scan_results = {
+    "is_scanning": False,
+    "projects": {}
+}
 
-def load_projects_config() -> tuple[Path, list[dict]]:
+# FastAPI Router instance
+router = APIRouter(prefix="/api")
+
+
+def load_projects_config() -> dict:
+    """Loads projects and roles configuration from projects.yaml."""
     if not CONFIG_PATH.exists():
-        return PROJECT_ROOT, []
+        print(f"Error: Config file not found at {CONFIG_PATH}")
+        return {"repos_dir": "/tmp/terraform_repos", "projects": []}
 
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-
-    repos_dir_str = data.get("repos_dir", "")
-    repos_base_dir = (PROJECT_ROOT / repos_dir_str).resolve()
-    projects_list = data.get("projects", [])
-
-    return repos_base_dir, projects_list
+    with open(CONFIG_PATH, "r") as f:
+        return yaml.safe_load(f) or {}
 
 
 def ensure_repo_cloned(repo_url: str, repo_dir: Path) -> tuple[bool, str]:
-    # 1. If repo already exists, pull the latest changes from main
+    """Clones repository once or pulls the latest main branch with shallow fetch."""
     if repo_dir.exists() and (repo_dir / ".git").exists():
         try:
-            # Fetch latest remote changes
             subprocess.run(
-                ["git", "fetch", "origin"],
+                ["git", "fetch", "--depth", "1", "origin", "main"],
                 cwd=repo_dir,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            # Checkout main (or master) and pull
             pull_proc = subprocess.run(
                 ["git", "checkout", "main"],
                 cwd=repo_dir,
@@ -53,7 +70,6 @@ def ensure_repo_cloned(repo_url: str, repo_dir: Path) -> tuple[bool, str]:
                 check=False,
             )
             if pull_proc.returncode != 0:
-                # Fallback if the default branch is 'master' instead of 'main'
                 subprocess.run(
                     ["git", "checkout", "master"],
                     cwd=repo_dir,
@@ -63,17 +79,16 @@ def ensure_repo_cloned(repo_url: str, repo_dir: Path) -> tuple[bool, str]:
                 )
 
             subprocess.run(
-                ["git", "pull"],
+                ["git", "pull", "--ff-only"],
                 cwd=repo_dir,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            return True, "Updated local repository to latest main."
+            return True, "Updated local repository."
         except Exception as exc:
             return False, f"Failed to pull latest git changes: {str(exc)}"
 
-    # 2. If repo does NOT exist, clone it into the specified directory
     if not repo_url:
         return False, f"Directory '{repo_dir}' does not exist and no repo_url provided."
 
@@ -81,12 +96,11 @@ def ensure_repo_cloned(repo_url: str, repo_dir: Path) -> tuple[bool, str]:
 
     try:
         process = subprocess.run(
-            ["git", "clone", repo_url, str(repo_dir)],
+            ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
             capture_output=True,
             text=True,
             check=False,
         )
-
         if process.returncode == 0:
             return True, "Cloned repository successfully."
         else:
@@ -95,152 +109,175 @@ def ensure_repo_cloned(repo_url: str, repo_dir: Path) -> tuple[bool, str]:
         return False, f"Failed to execute git clone: {str(exc)}"
 
 
-def build_initial_results() -> Dict[str, Any]:
-    repos_base_dir, target_projects = load_projects_config()
-    initial_projects = {}
-
-    for proj in target_projects:
-        proj_name = proj.get("project_name", "Unknown Project")
-        roles_list = proj.get("roles", []) or []
-
-        env_matrix = {}
-        for env in ENVIRONMENTS:
-            env_matrix[env] = {
-                "status": "Not Scanned",
-                "summary": f"No scan executed yet for {env.upper()}.",
-                "role_results": {},
-            }
-
-        initial_projects[proj_name] = {
-            "environments": env_matrix,
-            "roles": roles_list,
-        }
-
-    return initial_projects
-
-
-current_results: Dict[str, Any] = build_initial_results()
-
-
-def run_single_plan(role_path: str, environment: str) -> dict:
-    if not os.path.exists(role_path):
+def run_make_plan(role_dir: Path, env: str) -> dict:
+    """Executes 'make plan-<env>' inside the specific role path directory."""
+    if not role_dir.exists():
         return {
-            "status": "error",
-            "summary": f"Role path '{role_path}' does not exist on disk.",
+            "status": "Error",
+            "summary": f"Directory path does not exist: {role_dir}"
         }
 
-    target_cmd = f"plan-{environment}"
-
+    target = f"plan-{env}"
     try:
-        process = subprocess.Popen(
-            ["make", target_cmd],
-            cwd=role_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+        process = subprocess.run(
+            ["make", target],
+            cwd=role_dir,
+            capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
+            check=False,
         )
 
-        stdout_output, _ = process.communicate()
-        output = stdout_output or "No output returned from process."
+        stdout = process.stdout or ""
+        stderr = process.stderr or ""
+        full_output = (stdout + "\n" + stderr).strip()
 
         if process.returncode == 0:
             status = "In Sync"
-        elif process.returncode == 2:
+        elif process.returncode == 2 or "Terraform will perform the following actions" in full_output:
             status = "Drift Detected"
         else:
             status = "Error"
 
-        return {"status": status, "summary": output}
+        return {
+            "status": status,
+            "summary": full_output if full_output else "No output produced."
+        }
 
     except Exception as exc:
-        return {"status": "Error", "summary": f"Execution Exception: {str(exc)}"}
+        return {
+            "status": "Error",
+            "summary": f"Failed to execute make command: {str(exc)}"
+        }
 
 
-async def background_drift_scan():
-    global is_scanning, current_results
+def scan_single_target(project_name: str, repo_dir: Path, role_path: str, env: str) -> tuple[str, str, str, dict]:
+    """Helper worker for thread pool scanning."""
+    role_dir = repo_dir / role_path
+    result = run_make_plan(role_dir, env)
+    return project_name, role_path, env, result
+
+
+def run_full_scan():
+    """Main background scan worker executing throttled scans across all roles and envs."""
+    global is_scanning, current_scan_results
     is_scanning = True
+    current_scan_results["is_scanning"] = True
 
-    try:
-        repos_base_dir, target_projects = load_projects_config()
-        updated_projects = {}
+    config = load_projects_config()
+    repos_base = Path(config.get("repos_dir", "/tmp/terraform_repos"))
+    projects_list = config.get("projects", [])
 
-        for proj in target_projects:
-            proj_name = proj.get("project_name", "Unknown Project")
-            repo_url = proj.get("repo_url", "")
-            roles_list = proj.get("roles", []) or []
+    scan_tree = {}
 
-            repo_dir = repos_base_dir / proj_name
-            cloned, clone_msg = ensure_repo_cloned(repo_url, repo_dir)
+    for proj in projects_list:
+        project_name = proj.get("project_name")
+        repo_url = proj.get("repo_url")
+        roles = proj.get("roles", [])
+        repo_dir = repos_base / project_name
 
-            env_matrix = {}
+        repo_ok, repo_msg = ensure_repo_cloned(repo_url, repo_dir)
 
-            for env in ENVIRONMENTS:
-                role_results = {}
-                overall_status = "In Sync"
-                summaries = []
+        scan_tree[project_name] = {
+            "roles": roles,
+            "environments": {
+                env: {"status": "Not Scanned", "summary": "", "role_results": {}}
+                for env in ENVIRONMENTS
+            }
+        }
 
-                if not cloned:
-                    env_matrix[env] = {
+        for env in ENVIRONMENTS:
+            for role_path in roles:
+                if not repo_ok:
+                    scan_tree[project_name]["environments"][env]["role_results"][role_path] = {
                         "status": "Error",
-                        "summary": f"Repository checkout failed: {clone_msg}",
-                        "role_results": {},
+                        "summary": repo_msg
                     }
-                    continue
 
-                for role_rel_path in roles_list:
-                    role_path = str(repo_dir / role_rel_path)
+    tasks = []
+    # Strict max_workers limit prevents system thrashing/crashing
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WORKERS) as executor:
+        for proj in projects_list:
+            project_name = proj.get("project_name")
+            roles = proj.get("roles", [])
+            repo_dir = repos_base / project_name
 
-                    loop = asyncio.get_running_loop()
-                    result = await loop.run_in_executor(
-                        None, run_single_plan, role_path, env
+            if not (repo_dir / ".git").exists():
+                continue
+
+            for role_path in roles:
+                for env in ENVIRONMENTS:
+                    tasks.append(
+                        executor.submit(
+                            scan_single_target,
+                            project_name,
+                            repo_dir,
+                            role_path,
+                            env
+                        )
                     )
 
-                    role_results[role_rel_path] = result
-                    summaries.append(f"--- {role_rel_path} ---\n{result['summary']}")
+        for future in as_completed(tasks):
+            project_name, role_path, env, res = future.result()
 
-                    if result["status"] == "Error":
-                        overall_status = "Error"
-                    elif result["status"] == "Drift Detected" and overall_status != "Error":
-                        overall_status = "Drift Detected"
+            env_dict = scan_tree[project_name]["environments"][env]
+            env_dict["role_results"][role_path] = res
 
-                env_matrix[env] = {
-                    "status": overall_status,
-                    "summary": "\n\n".join(summaries),
-                    "role_results": role_results,
+            current_status = env_dict["status"]
+            new_status = res["status"]
+
+            if new_status == "Error":
+                env_dict["status"] = "Error"
+            elif new_status == "Drift Detected" and current_status != "Error":
+                env_dict["status"] = "Drift Detected"
+            elif new_status == "In Sync" and current_status not in ["Error", "Drift Detected"]:
+                env_dict["status"] = "In Sync"
+
+    current_scan_results = {
+        "is_scanning": False,
+        "projects": scan_tree
+    }
+    is_scanning = False
+
+
+def get_results() -> dict:
+    """Returns current scan state or initializes project structure from projects.yaml."""
+    global current_scan_results
+
+    if not current_scan_results.get("projects"):
+        config = load_projects_config()
+        projects_list = config.get("projects", [])
+        scan_tree = {}
+
+        for proj in projects_list:
+            project_name = proj.get("project_name")
+            roles = proj.get("roles", [])
+
+            scan_tree[project_name] = {
+                "roles": roles,
+                "environments": {
+                    env: {"status": "Not Scanned", "summary": "", "role_results": {}}
+                    for env in ENVIRONMENTS
                 }
-
-            updated_projects[proj_name] = {
-                "environments": env_matrix,
-                "roles": roles_list,
             }
 
-        current_results = updated_projects
+        current_scan_results["projects"] = scan_tree
 
-    finally:
-        is_scanning = False
+    current_scan_results["is_scanning"] = is_scanning
+    return current_scan_results
 
 
 @router.get("/results")
-async def get_results():
-    return JSONResponse(
-        content={
-            "is_scanning": is_scanning,
-            "projects": current_results,
-        }
-    )
+def read_results():
+    """Returns current scan state to API caller."""
+    return get_results()
 
 
 @router.post("/scan/trigger")
-async def trigger_scan(background_tasks: BackgroundTasks):
+def trigger_scan(background_tasks: BackgroundTasks):
+    """Triggers background drift scan job."""
     global is_scanning
-
     if is_scanning:
-        return JSONResponse(
-            status_code=400,
-            content={"message": "Scan is already in progress"},
-        )
+        raise HTTPException(status_code=400, detail="Scan is already running in background.")
 
-    background_tasks.add_task(background_drift_scan)
-    return {"status": "started", "message": "Drift scan initiated successfully"}
+    background_tasks.add_task(run_full_scan)
+    return {"message": "Scan triggered successfully."}

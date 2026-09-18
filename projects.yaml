@@ -1,5 +1,5 @@
 repos_dir: "../../workspace_repos"
- 
+
 projects:
   - project_name: "alo-terraform"
     repo_url: "git@github.com:colorimageapparel/alo-terraform.git"
